@@ -1,0 +1,80 @@
+import os
+import hopsworks
+import pandas as pd
+from dotenv import load_dotenv
+from datetime import datetime, timedelta
+from aqi_utils import fetch_aqi_data, process_aqi_data, feature_engineering
+
+# Load environment variables
+load_dotenv()
+
+def run_feature_pipeline():
+    # 1. Connect to Hopsworks
+    # Using connection for consistency
+    project = hopsworks.login(
+        api_key_value=os.getenv("HOPSWORKS_API_KEY", "").strip(),
+        project=os.getenv("HOPSWORKS_PROJECT_NAME", "").strip(),
+        host=os.getenv("HOPSWORKS_HOST", "c.app.hopsworks.ai")
+    )
+    fs = project.get_feature_store()
+    
+    # 2. Fetch Live Data
+    print("Fetching live data...")
+    raw_data = fetch_aqi_data(os.getenv("AQICN_API_KEY"))
+    current_df = process_aqi_data(raw_data)
+    
+    if current_df.empty:
+        print("No data fetched. Exiting.")
+        return
+
+    # 3. Fetch History for Context (Lags/Rolling)
+    # We need at least 24 hours of history to compute 24h lag/rolling
+    print("Fetching context from Feature Store...")
+    try:
+        aqi_fg = fs.get_feature_group(name="aqi_readings", version=1)
+        # Fetch last 48 hours to be safe
+        # Note: 'read' can be heavy, in prod use query with filter if possible or online FS
+        # For batch pipeline, reading recent partition is okay.
+        # Efficient way: select_all() and filter by date.
+        
+        # Calculate cutoff time
+        cutoff_date = pd.Timestamp.now() - pd.Timedelta(hours=48)
+        
+        # This reads into a dataframe
+        # In a real heavy-load scenario, we would use a more specific query or external DB
+        history_df = aqi_fg.select_all().read() 
+        history_df['date'] = pd.to_datetime(history_df['date'])
+        history_df = history_df[history_df['date'] >= cutoff_date]
+        
+    except Exception as e:
+        print(f"Could not fetch history (maybe first run or FG doesn't exist): {e}")
+        history_df = pd.DataFrame()
+
+    # 4. Combine & Compute Features
+    print("Computing features...")
+    if not history_df.empty:
+        # Drop the current timestamp if it already exists in history to avoid dups before processing
+        # (Though process_aqi_data sorts it out)
+        history_df = history_df[history_df['date'] < current_df['date'].iloc[0]]
+        full_df = pd.concat([history_df, current_df])
+    else:
+        full_df = current_df
+        
+    full_df = full_df.sort_values('date')
+    processed_df = feature_engineering(full_df)
+    
+    # 5. Extract only the new data point(s)
+    # We only want to insert the latest row(s) that match our current fetch
+    new_data = processed_df[processed_df['date'].isin(current_df['date'])]
+    
+    if new_data.empty:
+        print("No new unique data to insert.")
+        return
+
+    # 6. Insert into Feature Store
+    print(f"Inserting {len(new_data)} rows...")
+    aqi_fg.insert(new_data)
+    print("Feature Pipeline complete!")
+
+if __name__ == "__main__":
+    run_feature_pipeline()

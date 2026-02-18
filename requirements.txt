@@ -1,0 +1,16 @@
+hopsworks==4.6.*
+pandas
+numpy
+scikit-learn
+tensorflow
+shap
+streamlit
+fastapi
+uvicorn
+requests
+python-dotenv
+plotly
+pytest
+confluent-kafka
+idna<3.7 # pinned for compatibility if needed, but keeping open for now
+urllib3<2 # often needed for some older libs or cloud SDKs

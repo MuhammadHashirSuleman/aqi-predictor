@@ -1,0 +1,10 @@
+AQICN (Air Quality Data)
+03a0b5a981611692388af519dbcbf7fb0f09b29e
+
+
+OpenWeatherMap
+cccd7d0fa9d7c6787a2eab7490c58630
+
+
+HopsWorks Api Key
+2PLxOKLI94lQd6ag.rennDE0vl7QRgxJ7KGUpUQgI3Gpue0yhfrALCEqhiaSDaeTaa1DiULjJYSNqpZGJ
