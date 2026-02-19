@@ -51,14 +51,16 @@ def run_feature_pipeline():
     print("Fetching context from Feature Store...")
     history_df = pd.DataFrame()
     try:
-        # Calculate cutoff time
-        cutoff_date = pd.Timestamp.now() - pd.Timedelta(hours=48)
+        # Calculate cutoff time (timezone-aware to match Hopsworks)
+        cutoff_date = pd.Timestamp.now(tz='UTC') - pd.Timedelta(hours=48)
         
         # This reads into a dataframe
         history_df = aqi_fg.select_all().read() 
         if not history_df.empty:
-            history_df['date'] = pd.to_datetime(history_df['date'])
+            history_df['date'] = pd.to_datetime(history_df['date'], utc=True)
             history_df = history_df[history_df['date'] >= cutoff_date]
+            # Convert back to timezone-naive for processing
+            history_df['date'] = history_df['date'].dt.tz_localize(None)
         
     except Exception as e:
         print(f"Could not fetch history (maybe first run): {e}")
@@ -88,8 +90,8 @@ def run_feature_pipeline():
     # 7. Insert into Feature Store
     print(f"Inserting {len(new_data)} rows...")
     
-    # CASTING to match Hopsworks schema (int for AQI, float for others)
-    new_data['aqi'] = new_data['aqi'].astype(int)
+    # CASTING to match Hopsworks schema (all numeric as float/double)
+    new_data['aqi'] = new_data['aqi'].astype(float)
     new_data['pm25'] = new_data['pm25'].astype(float)
     new_data['pm10'] = new_data['pm10'].astype(float)
     new_data['temperature'] = new_data['temperature'].astype(float)
