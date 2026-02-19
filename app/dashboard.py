@@ -179,7 +179,7 @@ st.markdown("---")
 st.markdown("### 🔮 3-Day AQI Forecast")
 
 try:
-    response = requests.get(f"{API_URL}/predict", timeout=10)
+    response = requests.get(f"{API_URL}/predict", timeout=120)  # 2 min timeout for Hopsworks
     if response.status_code == 200:
         preds = response.json()
         

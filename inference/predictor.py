@@ -3,7 +3,7 @@ import hopsworks
 import joblib
 import pandas as pd
 import numpy as np
-import tensorflow as tf
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,12 +22,17 @@ class AQIPredictor:
         self.feature_cols = None
         self.model_meta = None
         
+        # Caching
+        self._features_cache = None
+        self._features_cache_time = None
+        self._prediction_cache = None
+        self._prediction_cache_time = None
+        self._cache_ttl = 600  # 10 minutes
+        
     def load_model(self):
         """Downloads and loads the latest approved model."""
         try:
             print("Fetching latest model...")
-            # specific logic to get better model version if needed, here taking latest version
-            # In prod, filter by "production" tag
             model_meta = self.mr.get_models("aqi_forecaster")[0] 
             self.model_meta = model_meta
             
@@ -36,12 +41,7 @@ class AQIPredictor:
             # Load scaler and feature columns
             self.scaler = joblib.load(os.path.join(model_dir, "scaler.pkl"))
             self.feature_cols = joblib.load(os.path.join(model_dir, "feature_cols.pkl"))
-            
-            # Load Model
-            if model_meta.framework == "tensorflow":
-                self.model = tf.keras.models.load_model(os.path.join(model_dir, "model.h5"))
-            else:
-                self.model = joblib.load(os.path.join(model_dir, "model.pkl"))
+            self.model = joblib.load(os.path.join(model_dir, "model.pkl"))
                 
             print(f"Model {model_meta.name} v{model_meta.version} loaded.")
             return True
@@ -50,42 +50,51 @@ class AQIPredictor:
             return False
 
     def fetch_latest_features(self):
-        """Fetches the most recent feature vector from the Online Feature Store."""
+        """Fetches features with caching to avoid slow Hopsworks calls."""
+        # Check cache first
+        if self._features_cache is not None and self._features_cache_time is not None:
+            elapsed = (datetime.now() - self._features_cache_time).total_seconds()
+            if elapsed < self._cache_ttl:
+                print(f"Using cached features ({int(self._cache_ttl - elapsed)}s remaining)")
+                return self._features_cache
+        
         try:
+            print("Fetching features from Hopsworks (this may take a minute)...")
             aqi_fg = self.fs.get_feature_group(name="aqi_readings", version=2)
             if aqi_fg is None:
                 print("Error: Feature group 'aqi_readings' version 2 not found.")
-                return None
-                
-            # We need the very last row sorted by time
-            # For online retrieval, we typically query by primary key (date). 
-            # Since 'date' changes, we might good query pattern:
-            # 1. Get offline max date. 2. Fetch.
-            # OR better: use `read()` on FG, sort, take tail. 
-            # For "Serverless" we might want to use the API data directly if FG latency is an issue,
-            # but using FG ensures consistency.
-            # Efficient: select_all(), filter by date > (now - 2 hours)
-            
-            # Simple approach for now
-            cutoff = pd.Timestamp.now() - pd.Timedelta(hours=24*2) # Need context? 
-            # Actually, standard inference just needs the current state vector. 
-            # My training used a single row of features + engineered Lags. 
-            # So I just need the *latest* row that has all columns fully populated.
+                return self._features_cache  # Return stale cache if available
             
             df = aqi_fg.select_all().read()
             df['date'] = pd.to_datetime(df['date'])
-            latest_data = df.sort_values('date').iloc[[-1]] # Take last row
+            latest_data = df.sort_values('date').iloc[[-1]]
+            
+            # Update cache
+            self._features_cache = latest_data
+            self._features_cache_time = datetime.now()
+            print("Features cached successfully!")
+            
             return latest_data
             
         except Exception as e:
             print(f"Error fetching features: {e}")
+            # Return stale cache if available
+            if self._features_cache is not None:
+                print("Returning stale cached features")
+                return self._features_cache
             return None
 
     def predict(self, data=None):
         """
-        Generates predictions for T+24, T+48, T+72.
-        Input: DataFrame with same features as training.
+        Generates predictions for T+24, T+48, T+72 with caching.
         """
+        # Check prediction cache first
+        if self._prediction_cache is not None and self._prediction_cache_time is not None:
+            elapsed = (datetime.now() - self._prediction_cache_time).total_seconds()
+            if elapsed < self._cache_ttl:
+                print(f"Using cached prediction ({int(self._cache_ttl - elapsed)}s remaining)")
+                return self._prediction_cache
+        
         if self.model is None:
             if not self.load_model():
                 return None
@@ -94,33 +103,32 @@ class AQIPredictor:
             data = self.fetch_latest_features()
         
         if data is None or data.empty:
-            return None
+            return self._prediction_cache  # Return stale cache
             
-        # Ensure columns match training (use saved feature_cols)
+        # Ensure columns match training
         if self.feature_cols:
-            X = data[self.feature_cols]
+            X = data[self.feature_cols].values
         else:
-            # Fallback if feature_cols.pkl is missing (less safe)
             drop_cols = ['date', 'city', 'y_24', 'y_48', 'y_72']
             input_cols = [c for c in data.columns if c not in drop_cols]
-            X = data[input_cols]
+            X = data[input_cols].values
         
         # Scale
         if self.scaler:
             X_scaled = self.scaler.transform(X)
         else:
-            X_scaled = X.values
+            X_scaled = X
 
         # Predict
-        if self.model_meta.framework == "tensorflow":
-             # Reshape for LSTM if needed: (1, 1, features)
-             X_reshaped = X_scaled.reshape((X_scaled.shape[0], 1, X_scaled.shape[1]))
-             preds = self.model.predict(X_reshaped)
-        else:
-             preds = self.model.predict(X_scaled)
+        preds = self.model.predict(X_scaled)
+        result = preds[0]
+        
+        # Cache prediction
+        self._prediction_cache = result
+        self._prediction_cache_time = datetime.now()
+        print("Prediction cached!")
              
-        # preds shape: (1, 3) -> [24h, 48h, 72h]
-        return preds[0]
+        return result
 
 if __name__ == "__main__":
     predictor = AQIPredictor()
