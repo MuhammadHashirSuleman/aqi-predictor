@@ -41,6 +41,10 @@ def run_feature_pipeline():
         event_time="date",
         online_enabled=True
     )
+    print(f"Feature Group object: {aqi_fg}, type: {type(aqi_fg)}")
+    
+    if aqi_fg is None:
+        raise RuntimeError("Failed to get or create feature group - returned None")
 
     # 4. Fetch History for Context (Lags/Rolling)
     # We need at least 24 hours of history to compute 24h lag/rolling
