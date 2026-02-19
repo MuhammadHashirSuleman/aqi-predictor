@@ -1,7 +1,8 @@
-hopsworks==4.7.*
+hopsworks[python]==4.7.*
 pandas
 numpy
 scikit-learn
 requests
 python-dotenv
 joblib
+pyarrow
