@@ -77,6 +77,20 @@ def run_feature_pipeline():
 
     # 6. Insert into Feature Store
     print(f"Inserting {len(new_data)} rows...")
+    
+    # CASTING to match Hopsworks schema (int for AQI, float for others)
+    new_data['aqi'] = new_data['aqi'].astype(int)
+    new_data['pm25'] = new_data['pm25'].astype(float)
+    new_data['pm10'] = new_data['pm10'].astype(float)
+    new_data['temperature'] = new_data['temperature'].astype(float)
+    new_data['humidity'] = new_data['humidity'].astype(float)
+    new_data['pressure'] = new_data['pressure'].astype(float)
+    new_data['wind_speed'] = new_data['wind_speed'].astype(float)
+    new_data['pm_ratio'] = new_data['pm_ratio'].astype(float)
+    
+    # Ensure date is timezone-naive or strictly UTC to match Hopsworks
+    new_data['date'] = pd.to_datetime(new_data['date']).dt.tz_localize(None)
+
     aqi_fg.insert(new_data)
     print("Feature Pipeline complete!")
 
