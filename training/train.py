@@ -57,8 +57,16 @@ def train_model():
     # 2. Fetch
     print("Fetching training data...")
     try:
-        aqi_fg = fs.get_feature_group(name="aqi_readings", version=1)
-        df = aqi_fg.select_all().read()
+        # Try version 1 first (original backfill), fallback to version 2
+        try:
+            aqi_fg = fs.get_feature_group(name="aqi_readings", version=1)
+            df = aqi_fg.select_all().read()
+            if len(df) == 0:
+                raise Exception("Empty Feature Group")
+        except Exception:
+            print("  Trying version 2...")
+            aqi_fg = fs.get_feature_group(name="aqi_readings", version=2)
+            df = aqi_fg.select_all().read()
     except Exception as e:
         print(f"Failed to fetch feature group: {e}")
         return

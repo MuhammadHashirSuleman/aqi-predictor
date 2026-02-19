@@ -1,8 +1,12 @@
 import os
+import sys
 import hopsworks
 import pandas as pd
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+
+# Add features/ to path so imports work from repo root OR features/ dir
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from aqi_utils import fetch_aqi_data, process_aqi_data, feature_engineering
 
 # Load environment variables

@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-ci.txt
 
       - name: Run Feature Pipeline
         env:
@@ -33,8 +33,7 @@ jobs:
           AQICN_API_KEY: ${{ secrets.AQICN_API_KEY }}
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
         run: |
-          cd features
-          python feature_pipeline.py
+          python features/feature_pipeline.py
 
       - name: Notify on failure
         if: failure()
