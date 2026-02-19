@@ -31,30 +31,36 @@ def run_feature_pipeline():
         print("No data fetched. Exiting.")
         return
 
-    # 3. Fetch History for Context (Lags/Rolling)
+    # 3. Get or create Feature Group (ensures it exists for insert later)
+    print("Getting/creating Feature Group...")
+    aqi_fg = fs.get_or_create_feature_group(
+        name="aqi_readings",
+        version=2,
+        description="Hourly AQI readings with features",
+        primary_key=["city"],
+        event_time="date",
+        online_enabled=True
+    )
+
+    # 4. Fetch History for Context (Lags/Rolling)
     # We need at least 24 hours of history to compute 24h lag/rolling
     print("Fetching context from Feature Store...")
+    history_df = pd.DataFrame()
     try:
-        aqi_fg = fs.get_feature_group(name="aqi_readings", version=1)
-        # Fetch last 48 hours to be safe
-        # Note: 'read' can be heavy, in prod use query with filter if possible or online FS
-        # For batch pipeline, reading recent partition is okay.
-        # Efficient way: select_all() and filter by date.
-        
         # Calculate cutoff time
         cutoff_date = pd.Timestamp.now() - pd.Timedelta(hours=48)
         
         # This reads into a dataframe
-        # In a real heavy-load scenario, we would use a more specific query or external DB
         history_df = aqi_fg.select_all().read() 
-        history_df['date'] = pd.to_datetime(history_df['date'])
-        history_df = history_df[history_df['date'] >= cutoff_date]
+        if not history_df.empty:
+            history_df['date'] = pd.to_datetime(history_df['date'])
+            history_df = history_df[history_df['date'] >= cutoff_date]
         
     except Exception as e:
-        print(f"Could not fetch history (maybe first run or FG doesn't exist): {e}")
+        print(f"Could not fetch history (maybe first run): {e}")
         history_df = pd.DataFrame()
 
-    # 4. Combine & Compute Features
+    # 5. Combine & Compute Features
     print("Computing features...")
     if not history_df.empty:
         # Drop the current timestamp if it already exists in history to avoid dups before processing
@@ -67,7 +73,7 @@ def run_feature_pipeline():
     full_df = full_df.sort_values('date')
     processed_df = feature_engineering(full_df)
     
-    # 5. Extract only the new data point(s)
+    # 6. Extract only the new data point(s)
     # We only want to insert the latest row(s) that match our current fetch
     new_data = processed_df[processed_df['date'].isin(current_df['date'])]
     
@@ -75,7 +81,7 @@ def run_feature_pipeline():
         print("No new unique data to insert.")
         return
 
-    # 6. Insert into Feature Store
+    # 7. Insert into Feature Store
     print(f"Inserting {len(new_data)} rows...")
     
     # CASTING to match Hopsworks schema (int for AQI, float for others)

@@ -20,7 +20,7 @@ st.markdown("### 3-Day Air Quality Forecast (100% Serverless MLOps)")
 # Sidebar
 st.sidebar.header("Controls")
 if st.sidebar.button("Refresh Forecast"):
-    st.experimental_rerun()
+    st.rerun()
 
 # 1. Fetch Current Data (Directly from API for display, or just rely on backend?)
 # To show "Current AQI", we can fetch from AQICN directly here or ask backend.

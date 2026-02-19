@@ -19,6 +19,7 @@ class AQIPredictor:
         self.mr = self.project.get_model_registry()
         self.model = None
         self.scaler = None
+        self.feature_cols = None
         self.model_meta = None
         
     def load_model(self):
@@ -32,8 +33,9 @@ class AQIPredictor:
             
             model_dir = model_meta.download()
             
-            # Load scaler
+            # Load scaler and feature columns
             self.scaler = joblib.load(os.path.join(model_dir, "scaler.pkl"))
+            self.feature_cols = joblib.load(os.path.join(model_dir, "feature_cols.pkl"))
             
             # Load Model
             if model_meta.framework == "tensorflow":
@@ -50,7 +52,11 @@ class AQIPredictor:
     def fetch_latest_features(self):
         """Fetches the most recent feature vector from the Online Feature Store."""
         try:
-            aqi_fg = self.fs.get_feature_group(name="aqi_readings", version=1)
+            aqi_fg = self.fs.get_feature_group(name="aqi_readings", version=2)
+            if aqi_fg is None:
+                print("Error: Feature group 'aqi_readings' version 2 not found.")
+                return None
+                
             # We need the very last row sorted by time
             # For online retrieval, we typically query by primary key (date). 
             # Since 'date' changes, we might good query pattern:
@@ -90,21 +96,14 @@ class AQIPredictor:
         if data is None or data.empty:
             return None
             
-        # Preprocess
-        # Ensure columns match training
-        # We need to drop metadata if present
-        drop_cols = ['date', 'y_24', 'y_48', 'y_72']
-        input_cols = [c for c in data.columns if c not in drop_cols]
-        # Ensure order matches (scaler expects specific order)
-        # We rely on dataframe column matching if passed to scaler directly?
-        # Standard scaler expects array. We must ensure column order is same as training.
-        # This is tricky without saving column names. 
-        # I did not save column names in 'train.py' explicitly, relying on dataframe order.
-        # Hopsworks feature group order is usually deterministic.
-        
-        X = data[input_cols]
-        # In a real system, I'd save feature_names.json with the model.
-        # Ignoring for this exercise speed, assuming order stability.
+        # Ensure columns match training (use saved feature_cols)
+        if self.feature_cols:
+            X = data[self.feature_cols]
+        else:
+            # Fallback if feature_cols.pkl is missing (less safe)
+            drop_cols = ['date', 'city', 'y_24', 'y_48', 'y_72']
+            input_cols = [c for c in data.columns if c not in drop_cols]
+            X = data[input_cols]
         
         # Scale
         if self.scaler:
