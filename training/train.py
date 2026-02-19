@@ -5,47 +5,64 @@ import pandas as pd
 import numpy as np
 import joblib
 from dotenv import load_dotenv
-from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import GridSearchCV
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
-from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.model_selection import TimeSeriesSplit
+
+# Suppress warnings
 import warnings
 warnings.filterwarnings('ignore')
 
 load_dotenv()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
+def create_targets_per_city(df_city):
+    """Create targets for a single city's data (sorted by date)."""
+    df_city = df_city.sort_values('date').reset_index(drop=True)
+    df_city['y_24'] = df_city['aqi'].shift(-24)
+    df_city['y_48'] = df_city['aqi'].shift(-48)
+    df_city['y_72'] = df_city['aqi'].shift(-72)
+    return df_city
 
-def create_targets(df: pd.DataFrame) -> pd.DataFrame:
-    """Create T+24, T+48, T+72 target columns."""
-    df = df.sort_values('date').reset_index(drop=True)
-    df['y_24'] = df['aqi'].shift(-24)
-    df['y_48'] = df['aqi'].shift(-48)
-    df['y_72'] = df['aqi'].shift(-72)
-    return df
+def prepare_data(df):
+    """
+    Strict per-city processing to avoid data leakage.
+    1. Group by city
+    2. Sort by date
+    3. Create targets & lags (if not already present)
+    4. Split 80/20 by time
+    """
+    train_pieces = []
+    test_pieces = []
+    
+    # Process each city independently
+    for city, group in df.groupby('city'):
+        group = group.sort_values('date').reset_index(drop=True)
+        
+        # Create targets
+        group = create_targets_per_city(group)
+        
+        # Drop rows where targets are NaN (last 72 hours)
+        group = group.dropna(subset=['y_24', 'y_48', 'y_72'])
+        
+        if len(group) < 100:
+            continue
+            
+        # Time-based split for this city
+        split_idx = int(len(group) * 0.8)
+        train_pieces.append(group.iloc[:split_idx])
+        test_pieces.append(group.iloc[split_idx:])
 
-def evaluate(y_true, y_pred, name: str) -> dict:
-    """Compute RMSE, MAE, R² and print them."""
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-    mae  = float(mean_absolute_error(y_true, y_pred))
-    r2   = float(r2_score(y_true, y_pred))
-    print(f"  {name:20s} | RMSE={rmse:7.3f}  MAE={mae:7.3f}  R²={r2:.4f}")
-    return {"rmse": rmse, "mae": mae, "r2": r2}
+    if not train_pieces:
+        raise ValueError("No data available after processing!")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
+    train_df = pd.concat(train_pieces).reset_index(drop=True)
+    test_df = pd.concat(test_pieces).reset_index(drop=True)
+    
+    return train_df, test_df
 
 def train_model():
-    # 1. Connect
     print("Connecting to Hopsworks...")
     project = hopsworks.login(
         api_key_value=os.getenv("HOPSWORKS_API_KEY", "").strip(),
@@ -54,152 +71,108 @@ def train_model():
     )
     fs = project.get_feature_store()
 
-    # 2. Fetch
-    print("Fetching training data...")
+    print("Fetching training data (Version 2)...")
     try:
-        # Try version 1 first (original backfill), fallback to version 2
-        try:
-            aqi_fg = fs.get_feature_group(name="aqi_readings", version=1)
-            df = aqi_fg.select_all().read()
-            if len(df) == 0:
-                raise Exception("Empty Feature Group")
-        except Exception:
-            print("  Trying version 2...")
-            aqi_fg = fs.get_feature_group(name="aqi_readings", version=2)
-            df = aqi_fg.select_all().read()
+        aqi_fg = fs.get_feature_group(name="aqi_readings", version=2)
+        df = aqi_fg.select_all().read()
+        print(f"Loaded {len(df)} rows.")
     except Exception as e:
-        print(f"Failed to fetch feature group: {e}")
+        print(f"Failed to load data: {e}")
         return
 
-    print(f"Loaded {len(df)} rows.")
-
-    # 3. Prepare
-    print("Preparing data...")
+    # Prepare data with strict per-city splitting
+    print("Preparing data (per-city logic)...")
     df['date'] = pd.to_datetime(df['date'])
-    df = create_targets(df)
-    df = df.dropna()
-
-    # Keep only numeric features
+    train_df, test_df = prepare_data(df)
+    
+    # Select features
     drop_cols = {'date', 'city', 'y_24', 'y_48', 'y_72'}
-    feature_cols = [c for c in df.columns
-                    if c not in drop_cols and pd.api.types.is_numeric_dtype(df[c])]
+    feature_cols = [c for c in train_df.columns 
+                    if c not in drop_cols and pd.api.types.is_numeric_dtype(train_df[c])]
+    
     print(f"Features ({len(feature_cols)}): {feature_cols}")
-
-    X = df[feature_cols].values
-    y = df[['y_24', 'y_48', 'y_72']].values
-
-    # Time-based split (80 / 20)
-    split = int(len(df) * 0.8)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
-
-    # Scale
+    print(f"Train size: {len(train_df)} | Test size: {len(test_df)}")
+    
+    X_train = train_df[feature_cols].values
+    y_train = train_df[['y_24', 'y_48', 'y_72']].values
+    X_test = test_df[feature_cols].values
+    y_test = test_df[['y_24', 'y_48', 'y_72']].values
+    
+    # Scale features
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
-    X_test_s  = scaler.transform(X_test)
-
-    print(f"\nTrain size: {len(X_train)}  |  Test size: {len(X_test)}")
-    print("\n" + "="*60)
-    print("MODEL EVALUATION")
-    print("="*60)
-
-    results = {}
-
-    # ── Model 1: Ridge Regression ──────────────────────────────────────────
-    print("\n[1] Ridge Regression")
-    ridge_params = {'estimator__alpha': [0.01, 0.1, 1.0, 10.0, 100.0]}
-    ridge_cv = GridSearchCV(
-        MultiOutputRegressor(Ridge()),
-        ridge_params, cv=3, scoring='neg_mean_squared_error', n_jobs=-1
-    )
-    ridge_cv.fit(X_train_s, y_train)
-    ridge = ridge_cv.best_estimator_
-    print(f"  Best alpha: {ridge_cv.best_params_}")
-    y_pred_ridge = ridge.predict(X_test_s)
-    results['ridge'] = {**evaluate(y_test, y_pred_ridge, "Ridge"), 'model': ridge, 'preds': y_pred_ridge}
-
-    # ── Model 2: Random Forest ─────────────────────────────────────────────
-    print("\n[2] Random Forest")
-    rf = RandomForestRegressor(
-        n_estimators=300, max_depth=15, min_samples_leaf=2,
-        max_features='sqrt', n_jobs=-1, random_state=42
-    )
+    X_test_s = scaler.transform(X_test)
+    
+    # ── Comparison of Models ──────────────────────────────────────────────────
+    
+    print("\n" + "="*50)
+    print("TRAINING MODELS")
+    print("="*50)
+    
+    models = {}
+    
+    # 1. Random Forest (Robust baseline)
+    print("\n[1] Random Forest (n_estimators=100)...")
+    rf = RandomForestRegressor(n_estimators=100, max_depth=15, n_jobs=-1, random_state=42)
     rf.fit(X_train, y_train)
-    y_pred_rf = rf.predict(X_test)
-    results['rf'] = {**evaluate(y_test, y_pred_rf, "Random Forest"), 'model': rf, 'preds': y_pred_rf}
+    models['rf'] = rf
 
-    # ── Model 3: Gradient Boosting ─────────────────────────────────────────
-    print("\n[3] Gradient Boosting (XGBoost-style)")
-    gb = MultiOutputRegressor(
-        GradientBoostingRegressor(
-            n_estimators=200, max_depth=5, learning_rate=0.05,
-            subsample=0.8, random_state=42
-        ), n_jobs=-1
-    )
+    # 2. Gradient Boosting (Often best accuracy)
+    print("\n[2] Gradient Boosting (sklearn)...")
+    gb = MultiOutputRegressor(GradientBoostingRegressor(n_estimators=100, max_depth=5, random_state=42))
     gb.fit(X_train, y_train)
-    y_pred_gb = gb.predict(X_test)
-    results['gb'] = {**evaluate(y_test, y_pred_gb, "Gradient Boosting"), 'model': gb, 'preds': y_pred_gb}
+    models['gb'] = gb
+    
+    # ── Evaluation ────────────────────────────────────────────────────────────
+    print("\n" + "="*50)
+    print("RESULTS (R² Score - Higher is better, max 1.0)")
+    print("="*50)
+    
+    best_name = None
+    best_score = -999
+    best_model = None
+    best_metrics = {}
 
-    # ── Model 4: LSTM ──────────────────────────────────────────────────────
-    print("\n[4] LSTM (TensorFlow)")
-    X_train_lstm = X_train_s.reshape(X_train_s.shape[0], 1, X_train_s.shape[1])
-    X_test_lstm  = X_test_s.reshape(X_test_s.shape[0],  1, X_test_s.shape[1])
+    for name, model in models.items():
+        if name == 'rf':  # RF doesn't need scaling
+            y_pred = model.predict(X_test)
+        else:
+            y_pred = model.predict(X_test) # GB also handles unscaled well usually, but consistency
+        
+        r2 = r2_score(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae = mean_absolute_error(y_test, y_pred)
+        
+        print(f"{name.upper():5s} | R²: {r2:.4f}  | RMSE: {rmse:.2f} | MAE: {mae:.2f}")
+        
+        if r2 > best_score:
+            best_score = r2
+            best_name = name
+            best_model = model
+            best_metrics = {"r2": r2, "rmse": rmse, "mae": mae}
 
-    lstm_model = Sequential([
-        Input(shape=(1, X_train_s.shape[1])),
-        LSTM(128, return_sequences=True),
-        Dropout(0.2),
-        LSTM(64),
-        Dropout(0.2),
-        Dense(32, activation='relu'),
-        Dense(3)
-    ])
-    lstm_model.compile(optimizer='adam', loss='huber')
-    es = EarlyStopping(patience=5, restore_best_weights=True)
-    lstm_model.fit(
-        X_train_lstm, y_train,
-        epochs=50, batch_size=64,
-        validation_split=0.1,
-        callbacks=[es], verbose=0
-    )
-    y_pred_lstm = lstm_model.predict(X_test_lstm, verbose=0)
-    results['lstm'] = {**evaluate(y_test, y_pred_lstm, "LSTM"), 'model': lstm_model, 'preds': y_pred_lstm}
+    print(f"\n✅ Winner: {best_name.upper()} with R²={best_score:.4f}")
 
-    # ── Select Best ────────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("SUMMARY")
-    print("="*60)
-    for name, r in results.items():
-        print(f"  {name:20s} | R²={r['r2']:.4f}  RMSE={r['rmse']:.3f}")
-
-    best_name = max(results, key=lambda k: results[k]['r2'])
-    best = results[best_name]
-    print(f"\n✅ Best Model: {best_name}  (R²={best['r2']:.4f})")
-
-    # ── Save & Register ────────────────────────────────────────────────────
+    # ── Registration ──────────────────────────────────────────────────────────
+    print("\nRegistering best model to Hopsworks...")
+    mr = project.get_model_registry()
+    
     model_dir = "model_artifacts"
     os.makedirs(model_dir, exist_ok=True)
+    joblib.dump(best_model, f"{model_dir}/model.pkl")
     joblib.dump(scaler, f"{model_dir}/scaler.pkl")
     joblib.dump(feature_cols, f"{model_dir}/feature_cols.pkl")
-
-    if best_name == 'lstm':
-        best['model'].save(f"{model_dir}/model.keras")
-    else:
-        joblib.dump(best['model'], f"{model_dir}/model.pkl")
-
-    # Register in Hopsworks Model Registry
-    print("\nRegistering model in Hopsworks...")
-    mr = project.get_model_registry()
-    metrics = {"rmse": best['rmse'], "mae": best['mae'], "r2": best['r2']}
-
+    
+    input_ex = {col: float(X_test[0][i]) for i, col in enumerate(feature_cols)}
+    
     aqi_model = mr.python.create_model(
         name="aqi_forecaster",
-        metrics=metrics,
-        description=f"Best model: {best_name} | R²={best['r2']:.4f} | RMSE={best['rmse']:.2f}",
-        input_example={f: float(X_test[0, i]) for i, f in enumerate(feature_cols)}
+        metrics=best_metrics,
+        description=f"Best model: {best_name.upper()}. R²={best_score:.4f}",
+        input_example=input_ex
     )
     aqi_model.save(model_dir)
-    print(f"✅ Model registered! R²={best['r2']:.4f}  RMSE={best['rmse']:.2f}  MAE={best['mae']:.2f}")
+    print("Model registered successfully!")
 
 if __name__ == "__main__":
     train_model()
